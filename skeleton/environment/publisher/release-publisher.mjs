@@ -1,35 +1,58 @@
-import duckdb from "duckdb";
-import fs from "fs"
-import { randomUUID } from "crypto";
-import { spawnSync } from "child_process";
-import util from "util"
+// ==== IMPORTS ====
 
+import duckdb from "duckdb";
+import fs from "node:fs"
+import { randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
+
+// ===== CONSTANTS ======
+
+const GET_SIGNING_KEY_URL = 'http://127.0.0.1:7070/v1/signing-key/current';
+const CURRENT_CERT_PATH = '/app/keys/current/current.cert.pem';
+const CURRENT_KEY_PATH = '/app/keys/current/current.key.pem';
+const PUBLICATIONS_URL = 'http://127.0.0.1:7070/v1/publications';
+const MANIFEST_FILE_PATH = './fixtures/build_manifest.csv';
+
+/**
+ * Fetches current signing key using V1 signing key API
+ * @returns current signing key
+ */
 const getCurrentKey = async () => {
-    const res = await fetch('http://127.0.0.1:7070/v1/signing-key/current')
+    const res = await fetch(GET_SIGNING_KEY_URL)
     return await res.json()
 }
 
+/**
+ * Creates the description string which is stringified object containing bundleId, artifactCount and totalBytes
+ * @param {string} bundleId 
+ * @param {Number} artifactCount 
+ * @param {Number} totalBytes 
+ * @returns description string
+ */
 const createDescriptor = (bundleId, artifactCount, totalBytes) => {
     const descriptor = {
         artifact_count: artifactCount,
         bundle_id: bundleId,
         total_bytes: totalBytes
     }
-    return JSON.stringify(descriptor,  Object.keys(descriptor).sort()).trim();
-} 
+    return JSON.stringify(descriptor, Object.keys(descriptor).sort()).trim();
+}
 
+/**
+ * Uses the descriptor string and signs descriptor file and current certificate/key
+ * @param {string} descriptor 
+ * @returns 
+ */
 const signDescriptor = (descriptor) => {
     const descriptorFilepath = `/app/tmp/descriptor-${randomUUID()}.bin`
     fs.writeFileSync(descriptorFilepath, descriptor, 'utf8')
-    const currentCertPath = '/app/keys/current/current.cert.pem'
-    const currentKeyPath = '/app/keys/current/current.key.pem'
 
     const signature = spawnSync(
         'openssl',
         [
-        'cms', '-sign', '-in', descriptorFilepath,
-        '-signer', currentCertPath, '-inkey', currentKeyPath,
-        '-outform', 'PEM', '-binary',
+            'cms', '-sign', '-in', descriptorFilepath,
+            '-signer', CURRENT_CERT_PATH, '-inkey', CURRENT_KEY_PATH,
+            '-outform', 'PEM', '-binary',
         ],
         { encoding: 'utf8' }
     )
@@ -37,8 +60,15 @@ const signDescriptor = (descriptor) => {
     return signature.stdout
 }
 
-const confirmPublication = async(descriptor, signature, token) => {
-    const res = await fetch('http://127.0.0.1:7070/v1/publications', {
+/**
+ * Calls publication URL to confirm publication
+ * @param {string} descriptor 
+ * @param {string} signature 
+ * @param {string} token 
+ * @returns confirm publication API result
+ */
+const confirmPublication = async (descriptor, signature, token) => {
+    const res = await fetch(PUBLICATIONS_URL, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
@@ -50,15 +80,27 @@ const confirmPublication = async(descriptor, signature, token) => {
     return await res.json()
 }
 
+/**
+ * Fetches all the bundles from build_manifest table
+ * @param {duckdb.Connection} conn 
+ * @returns all bundles
+ */
 function getBundles(conn) {
     return new Promise((resolve, reject) => {
-        conn.all(`SELECT bundle_id, COUNT(*) AS artifact_count, SUM(size_bytes) AS total_bytes FROM build_manifest where record_type = 'BUILD' AND entry_id NOT IN (select supersedes_id from build_manifest where record_type = 'WITHDRAWAL') GROUP BY bundle_id ORDER BY bundle_id`, function(err,res) {
+        conn.all(`SELECT bundle_id, COUNT(*) AS artifact_count, SUM(size_bytes) AS total_bytes FROM build_manifest where record_type = 'BUILD' AND entry_id NOT IN (select supersedes_id from build_manifest where record_type = 'WITHDRAWAL') GROUP BY bundle_id ORDER BY bundle_id`, function (err, res) {
             if (err) reject(err)
             else resolve(res)
         })
     })
 }
 
+/**
+ * Stores the published build results in published_builds table
+ * @param {duckdb.Connection} conn 
+ * @param {string} bundleId 
+ * @param {string} token 
+ * @param {string} pubId 
+ */
 function storeResult(conn, bundleId, token, pubId) {
     conn.run(`
         INSERT OR REPLACE INTO published_builds (
@@ -70,46 +112,72 @@ function storeResult(conn, bundleId, token, pubId) {
         )
     `)
 }
- 
-async function main() {
-    try {
-        const db = new duckdb.Database(
-            "releases.duckdb",
-            {
-                access_mode: "READ_WRITE",
-                max_memory: "512MB",
-                threads: "4",
-            },
-            (err) => {
-                if (err) {
-                    console.error(err);
-                }
-            },
-        );
 
-        const conn = db.connect();
-        conn.run(
-        `CREATE or REPLACE TABLE build_manifest AS SELECT * FROM './fixtures/build_manifest.csv'`, function (err, res) {
+/**
+ * creates the build_manifest table in duckDB and imports data using build_manifest.csv
+ * @param {duckdb.Connection} conn 
+ */
+function createBuildManifestTable(conn) {
+    conn.run(
+        `CREATE or REPLACE TABLE build_manifest AS SELECT * FROM '${MANIFEST_FILE_PATH}'`, function (err, res) {
             if (err) console.log(err);
         });
-        conn.run(`
-            CREATE or REPLACE TABLE published_builds (
-            bundle_id TEXT PRIMARY KEY,
-            request_token TEXT,
-            publication_id TEXT,
-            published_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )`, function (err, res) {
-            if (err) console.log(err);
-            console.log(res);
-        })
+}
+
+/**
+ * creates the published_builds table which stores the results after checking build manifests
+ * @param {duckdb.Connection} conn 
+ */
+function createPublishedBuildTable(conn) {
+    conn.run(`
+        CREATE or REPLACE TABLE published_builds (
+        bundle_id TEXT PRIMARY KEY,
+        request_token TEXT,
+        publication_id TEXT,
+        published_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`, function (err, res) {
+        if (err) console.log(err);
+    })
+}
+
+function createDB() {
+    return new duckdb.Database(
+        "releases.duckdb",
+        {
+            access_mode: "READ_WRITE",
+            max_memory: "512MB",
+            threads: "4",
+        },
+        (err) => {
+            if (err) {
+                console.error(err);
+            }
+        },
+    );
+}
+
+/**
+ * Main function
+ */
+async function main() {
+    try {
+        // setup duckDb and required tables
+        const db = createDB();
+        const conn = db.connect();
+        createBuildManifestTable(conn);
+        createPublishedBuildTable(conn);
+
+        // Fetch all bundles and parse the required fields for descriptor data
         const res = await getBundles(conn);
-        const bundles = res.map(bundle =>({bundle_id: bundle.bundle_id, artifact_count: Number(bundle.artifact_count), total_bytes: Number(bundle.total_bytes)}))
+        const bundles = res.map(bundle => ({ bundle_id: bundle.bundle_id, artifact_count: Number(bundle.artifact_count), total_bytes: Number(bundle.total_bytes) }))
         const currentKey = await getCurrentKey();
+
+        // Process bundles
         bundles.forEach(async (bundle) => {
             const token = `token-${bundle.bundle_id}`
             const descriptor = createDescriptor(bundle.bundle_id, bundle.artifact_count, bundle.total_bytes)
             const signature = signDescriptor(descriptor)
-            const published = await confirmPublication(descriptor,signature,token)
+            const published = await confirmPublication(descriptor, signature, token)
             storeResult(conn, bundle.bundle_id, published.request_token, published.publication_id)
             console.log(`BUNDLE ${bundle.bundle_id} SIGNED KEY=${currentKey.key_id}`)
             console.log(`BUNDLE ${bundle.bundle_id} PUBLISHED RECEIPT=${published.publication_id} TOKEN=${published.request_token} STATUS=${published.status}`)
@@ -118,4 +186,5 @@ async function main() {
         console.log("Error", error);
     }
 }
+
 await main();
