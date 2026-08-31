@@ -1,14 +1,14 @@
+name = "firmware-release-publisher"
 version = "2.0"
 
 [metadata]
-author_name = "scaffold"
-difficulty = "unknown"
+author_name = "Joseph Steffin"
 category = "security"
 subcategories = [
     "api_integration",
     "db_interaction",
 ]
-number_of_milestones = 0
+number_of_milestones = 6
 codebase_size = "small"
 languages = [
     "javascript",
