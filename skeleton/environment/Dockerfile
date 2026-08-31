@@ -19,6 +19,7 @@ RUN apt-get update \
         asciinema \
         build-essential \
         ca-certificates \
+        curl \
         openssl \
         python3 \
         python3-pip \
@@ -73,6 +74,9 @@ COPY distribution-gateway/ /app/distribution-gateway/
 # Task fixtures.
 COPY fixtures/build_manifest.csv /app/fixtures/build_manifest.csv
 COPY reports/publications.expected.txt /app/reports/publications.expected.txt
+
+# Publisher script
+COPY publisher/release-publisher.mjs /app/publisher/release-publisher.mjs
 
 # The verifier launches the gateway in the background and drives it over
 # localhost; there is no CMD that starts it. A default interactive shell suffices.

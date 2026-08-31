@@ -12,6 +12,7 @@ const CURRENT_CERT_PATH = '/app/keys/current/current.cert.pem';
 const CURRENT_KEY_PATH = '/app/keys/current/current.key.pem';
 const PUBLICATIONS_URL = 'http://127.0.0.1:7070/v1/publications';
 const MANIFEST_FILE_PATH = './fixtures/build_manifest.csv';
+const DB_NAME = 'releases.duckdb'
 
 /**
  * Fetches current signing key using V1 signing key API
@@ -44,7 +45,7 @@ const createDescriptor = (bundleId, artifactCount, totalBytes) => {
  * @returns 
  */
 const signDescriptor = (descriptor) => {
-    const descriptorFilepath = `/app/tmp/descriptor-${randomUUID()}.bin`
+    const descriptorFilepath = `/tmp/descriptor-${randomUUID()}.bin`
     fs.writeFileSync(descriptorFilepath, descriptor, 'utf8')
 
     const signature = spawnSync(
@@ -101,16 +102,35 @@ function getBundles(conn) {
  * @param {string} token 
  * @param {string} pubId 
  */
-function storeResult(conn, bundleId, token, pubId) {
+function storeResult(conn, bundleId, token, pubId, status) {
     conn.run(`
         INSERT OR REPLACE INTO published_builds (
         bundle_id,
         request_token,
-        publication_id
+        publication_id,
+        status
         ) VALUES (
-        '${bundleId}','${token}','${pubId}' 
+        '${bundleId}','${token}','${pubId}', '${status}' 
         )
-    `)
+    `, function (err, res) {
+        if (err) console.log(err);
+    })
+}
+
+/**
+ * Check if build already published in previous runs
+ * @param {duckdb.Connection} conn
+ * @param {string} bundleId
+ */
+function getExistingPublishedBuilds(conn) {
+    return new Promise((resolve, reject) => {
+        conn.all(`
+            SELECT bundle_id, publication_id, request_token, status from  published_builds WHERE status = 'PUBLISHED'
+            `, function (err, res) {
+            if (err) reject(err)
+            else resolve(res)
+        })
+    })
 }
 
 /**
@@ -119,7 +139,7 @@ function storeResult(conn, bundleId, token, pubId) {
  */
 function createBuildManifestTable(conn) {
     conn.run(
-        `CREATE or REPLACE TABLE build_manifest AS SELECT * FROM '${MANIFEST_FILE_PATH}'`, function (err, res) {
+        `CREATE TABLE IF NOT EXISTS build_manifest AS SELECT * FROM '${MANIFEST_FILE_PATH}'`, function (err, res) {
             if (err) console.log(err);
         });
 }
@@ -130,24 +150,24 @@ function createBuildManifestTable(conn) {
  */
 function createPublishedBuildTable(conn) {
     conn.run(`
-        CREATE or REPLACE TABLE published_builds (
+        CREATE TABLE IF NOT EXISTS published_builds (
         bundle_id TEXT PRIMARY KEY,
         request_token TEXT,
         publication_id TEXT,
-        published_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        published_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        status TEXT
     )`, function (err, res) {
         if (err) console.log(err);
     })
 }
 
+/**
+ * Initialize/Create Database
+ * @returns 
+ */
 function createDB() {
     return new duckdb.Database(
-        "releases.duckdb",
-        {
-            access_mode: "READ_WRITE",
-            max_memory: "512MB",
-            threads: "4",
-        },
+        DB_NAME,
         (err) => {
             if (err) {
                 console.error(err);
@@ -167,18 +187,27 @@ async function main() {
         createBuildManifestTable(conn);
         createPublishedBuildTable(conn);
 
+        // Fetch existing published bundles to avoid re-runs
+        const existingBundles = await getExistingPublishedBuilds(conn);
+        const bundleIds = new Set(existingBundles.map(bundle=>bundle.bundle_id));
+
         // Fetch all bundles and parse the required fields for descriptor data
         const res = await getBundles(conn);
         const bundles = res.map(bundle => ({ bundle_id: bundle.bundle_id, artifact_count: Number(bundle.artifact_count), total_bytes: Number(bundle.total_bytes) }))
         const currentKey = await getCurrentKey();
-
+        
         // Process bundles
         bundles.forEach(async (bundle) => {
             const token = `token-${bundle.bundle_id}`
-            const descriptor = createDescriptor(bundle.bundle_id, bundle.artifact_count, bundle.total_bytes)
-            const signature = signDescriptor(descriptor)
-            const published = await confirmPublication(descriptor, signature, token)
-            storeResult(conn, bundle.bundle_id, published.request_token, published.publication_id)
+            let published;
+            if (!bundleIds.has(bundle.bundle_id)) {
+                const descriptor = createDescriptor(bundle.bundle_id, bundle.artifact_count, bundle.total_bytes)
+                const signature = signDescriptor(descriptor)
+                published = await confirmPublication(descriptor, signature, token)
+                storeResult(conn, bundle.bundle_id, published.request_token, published.publication_id, published.status)
+            } else {
+                published = existingBundles.find(existingBundle=>existingBundle.bundle_id === bundle.bundle_id)
+            }
             console.log(`BUNDLE ${bundle.bundle_id} SIGNED KEY=${currentKey.key_id}`)
             console.log(`BUNDLE ${bundle.bundle_id} PUBLISHED RECEIPT=${published.publication_id} TOKEN=${published.request_token} STATUS=${published.status}`)
         });
